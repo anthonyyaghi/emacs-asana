@@ -81,8 +81,12 @@ Asana free plan limit is 50. Asana premium plan limit is 1500."
 								 (cons :tag "Name and GID" (string :tag "Name") (string :tag "GID")))
 	:safe (lambda (x) (or (null x) (and (consp x) (stringp (car x)) (stringp (cdr x))))))
 
-:type 'string
-:safe (lambda (x) (stringp x))
+(defcustom asana-tag-priority-alist
+  '(("Top" . ?A) ("High" . ?B) ("Mid" . ?C) ("Low" . ?D))
+  "Alist mapping Asana tag names to org priority characters.
+Tags matched here are converted to org priorities and excluded from org tags."
+  :group 'asana
+  :type '(alist :key-type string :value-type character))
 
 (defcustom asana-tasks-org-file
   (expand-file-name "asana.org" (or (bound-and-true-p org-directory)
@@ -289,7 +293,9 @@ If CALLBACK is provided, run asynchronously."
 
 (defun asana-task-get (task-gid &optional callback)
   "Get task by TASK-GID. Run asynchronously if CALLBACK provided."
-  (asana-get (format "/tasks/%s" task-gid) nil callback))
+  (asana-get (format "/tasks/%s" task-gid)
+    '((opt_fields "name,completed,completed_at,assignee,assignee.name,created_at,modified_at,due_on,start_on,notes,parent,parent.name,parent.gid,tags,tags.name,projects,projects.name,memberships.project.name,followers,followers.name,liked,num_likes,hearted,num_hearts,workspace,workspace.name,workspace.gid,custom_fields"))
+    callback))
 
 (defun asana-task-stories (task-gid &optional callback)
   "Get task stories by TASK-GID. Run asynchronously if CALLBACK provided.
@@ -402,20 +408,29 @@ Task stories are comments, edit history, etc."
         (liked (eq (map-elt task 'liked) t))
         (hearted (eq (map-elt task 'hearted) t)))
 		(asana--workspace-refs-fetch workspace-gid)
-    (insert
-     (format
-      "%s%s%s\n"
-      (map-elt task 'name)
-			(if has-parent
-					(concat " ❬ " (map-nested-elt task '(parent name)))
-				"")
-      (if tags
-          (format
-					 "   %s:"
-					 (apply 'concat
-									(seq-map (lambda (tag) (concat ":" (string-replace " " "_" (map-elt tag 'name)))) tags)))
-				"")))
-		(if tags (org-align-tags))
+    ;; Extract priority from tags via asana-tag-priority-alist
+    (let (priority-char filtered-tags)
+      (dolist (tag tags)
+        (let ((match (assoc (map-elt tag 'name) asana-tag-priority-alist)))
+          (if (and match (not priority-char))
+              (setq priority-char (cdr match))
+            (push tag filtered-tags))))
+      (setq filtered-tags (nreverse filtered-tags))
+      (insert
+       (format
+        "%s%s%s%s\n"
+        (if priority-char (format "[#%c] " priority-char) "")
+        (map-elt task 'name)
+        (if has-parent
+            (concat " ❬ " (map-nested-elt task '(parent name)))
+          "")
+        (if filtered-tags
+            (format
+             "   %s:"
+             (apply 'concat
+                    (seq-map (lambda (tag) (concat ":" (string-replace " " "_" (map-elt tag 'name)))) filtered-tags)))
+          "")))
+      (if filtered-tags (org-align-tags)))
     (insert
      (format
       "%s%s%s"
@@ -454,7 +469,7 @@ Task stories are comments, edit history, etc."
     (insert
      (format ":ASANA_URL: [[https://app.asana.com/0/%s/%s]]\n" workspace-gid task-gid))
     (insert (format ":WORKSPACE: %s\n" (map-nested-elt task '(workspace name))))
-    (insert (format ":ASSIGNEE: %s\n" (map-nested-elt task '(assignee name))))
+    (insert (format ":ASSIGNEE: %s\n" (or (map-nested-elt task '(assignee name)) "unassigned")))
 		(when has-parent
 			(insert
 			 (format
@@ -500,7 +515,7 @@ Task stories are comments, edit history, etc."
         (format-time-string "[%Y-%m-%d %a %H:%M]" (date-to-time (map-elt entry 'created_at)))
         (map-elt entry 'type)))
       (let ((content-start (point))
-						(txt (map-elt entry 'text))
+						(txt (or (map-elt entry 'text) ""))
 						(fill-prefix "  ")
 						desc link idx gid)
 				(while (string-match "https://app.asana.com/0/\\([^/]+\\)/?\\w+" txt idx)
@@ -536,36 +551,59 @@ Task stories are comments, edit history, etc."
 (defun asana-org-task-sync (task stories)
   "Write one TASK and its STORIES to the current org-mode buffer."
 	(eval-and-compile (require 'org))
-  (save-excursion
-    (let* ((existing
-            (org-find-property
-             "ASANA_ID"
-             (format "%s-%s"
-                     (map-nested-elt task '(workspace gid))
-                     (map-elt task 'gid))))
-           id todo-state)
-      (cond (existing
-						 (goto-char existing)
-						 (setq id (org-id-get-create))
-						 (setq todo-state (org-get-todo-state))
-						 (save-excursion (org-insert-heading-respect-content))
-						 (delete-region
-							existing
-							(save-excursion (org-end-of-subtree t t) (point)))
-						 (end-of-line))
-						(t (org-insert-subheading nil)))
-			(save-excursion
-				(asana-org-task-insert task stories))
-			(if (eq (map-elt task 'completed) t)
-					(let (org-log-done)
-						(org-todo (or (car-safe (member todo-state org-done-keywords))
-													'done)))
-				(org-todo (or (car-safe (member todo-state org-not-done-keywords))
-											'nextset)))
-      (when id (org-entry-put (point) "ID" id)))))
+  (condition-case err
+      (save-excursion
+        (let* ((existing
+                (org-find-property
+                 "ASANA_ID"
+                 (format "%s-%s"
+                         (map-nested-elt task '(workspace gid))
+                         (map-elt task 'gid))))
+               id todo-state)
+          (cond (existing
+                 (goto-char existing)
+                 (setq id (org-id-get-create))
+                 (setq todo-state (org-get-todo-state))
+                 (save-excursion (org-insert-heading-respect-content))
+                 (delete-region
+                  existing
+                  (save-excursion (org-end-of-subtree t t) (point)))
+                 (end-of-line))
+                (t (org-insert-subheading nil)))
+          (save-excursion
+            (asana-org-task-insert task stories))
+          (if (eq (map-elt task 'completed) t)
+              (let (org-log-done)
+                (org-todo (or (car-safe (member todo-state org-done-keywords))
+                              'done)))
+            (org-todo (or (car-safe (member todo-state org-not-done-keywords))
+                          'nextset)))
+          (when id (org-entry-put (point) "ID" id))))
+    (error (message "asana: skipped task %s — %S" (map-elt task 'gid) err))))
+
+(defun asana--fetch-my-tasks-section-map ()
+  "Build a hash-table mapping task-gid to section-name for My Tasks.
+Queries the user_task_list API to get the real sections, since
+the memberships field on tasks does not include user_task_list sections."
+  (let* ((workspace-gid (asana-workspace-gid))
+         (utl (asana-get "/users/me/user_task_list"
+                `((workspace ,workspace-gid))))
+         (utl-gid (map-elt utl 'gid))
+         (sections (asana-get (format "/projects/%s/sections" utl-gid)
+                    '((opt_fields "name"))))
+         (section-map (make-hash-table :test 'equal)))
+    (dolist (section sections)
+      (let ((section-name (map-elt section 'name))
+            (section-gid (map-elt section 'gid)))
+        (asana--log "Fetching tasks for section: %s" section-name)
+        (dolist (task (asana-get (format "/sections/%s/tasks" section-gid)
+                       '((opt_fields "name"))))
+          (puthash (map-elt task 'gid) section-name section-map))))
+    section-map))
 
 (defun asana-org-tasks-digest (tasks)
-  "Dump TASKS into an org buffer backed by `asana-tasks-org-file'."
+  "Dump TASKS into an org buffer backed by `asana-tasks-org-file'.
+Tasks are grouped under section headings based on their Asana memberships."
 	(eval-and-compile
 		(require 'org)
 		(require 'org-element)
@@ -574,15 +612,62 @@ Task stories are comments, edit history, etc."
 	(goto-char (point-min))
 	(org-element-cache-reset)
 	(org-cycle '(64))
-  (unless (re-search-forward "^* Asana" nil t)
+  (unless (re-search-forward "^\\* Asana" nil t)
 		(goto-char (point-max))
 		(newline 2)
 		(insert "* Asana"))
-  (seq-doseq (task (map-values tasks))
-		(asana-org-task-sync (map-elt task 'props) (map-elt task 'stories)))
+  ;; Group tasks by section name using My Tasks section map
+  (let ((section-groups (make-hash-table :test 'equal))
+        (section-map (asana--fetch-my-tasks-section-map)))
+    (seq-doseq (entry tasks)
+      (let* ((task-gid (car entry))
+             (task (cdr entry))
+             (section (or (gethash task-gid section-map) "Unsectioned")))
+        (push task (gethash section section-groups))))
+    ;; Insert tasks grouped by section
+    (maphash
+     (lambda (section-name section-tasks)
+       (save-excursion
+         ;; Find or create the section heading under * Asana
+         (goto-char (point-min))
+         (re-search-forward "^\\* Asana" nil t)
+         (let ((asana-end (save-excursion (org-end-of-subtree t t) (point)))
+               (found nil))
+           (while (and (not found)
+                       (re-search-forward
+                        (format "^\\*\\* %s" (regexp-quote section-name))
+                        asana-end t))
+             (setq found t))
+           (unless found
+             ;; Create the section heading at end of * Asana subtree
+             (goto-char (point-min))
+             (re-search-forward "^\\* Asana" nil t)
+             (org-end-of-subtree t)
+             (newline)
+             (insert (format "** %s" section-name))))
+         ;; Now point is at the section heading; sync each task within it
+         (goto-char (point-min))
+         (re-search-forward (format "^\\*\\* %s" (regexp-quote section-name)) nil t)
+         (org-narrow-to-subtree)
+         (goto-char (point-max))
+         (dolist (task (nreverse section-tasks))
+           (asana-org-task-sync (map-elt task 'props) (map-elt task 'stories)))
+         (widen)))
+     section-groups))
   (org-indent-indent-buffer)
-  (org-sort-entries nil ?r nil nil "CREATED_AT")
-  (org-content 2))
+  ;; Sort within each section
+  (save-excursion
+    (goto-char (point-min))
+    (when (re-search-forward "^\\* Asana" nil t)
+      (org-narrow-to-subtree)
+      (goto-char (point-min))
+      (while (re-search-forward "^\\*\\* " nil t)
+        (org-narrow-to-subtree)
+        (org-sort-entries nil ?r nil nil "CREATED_AT")
+        (widen)
+        (org-end-of-subtree t))
+      (widen)))
+  (org-content 3))
 
 ;; Helm
 
